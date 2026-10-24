@@ -1,5 +1,14 @@
 {
   "api_id": "YOUR_API_ID",
   "api_hash": "YOUR_API_HASH", 
-  "phone": "YOUR_PHONE_NUMBER"
+  "phone": "YOUR_PHONE_NUMBER",
+  "bot_token": "YOUR_BOT_TOKEN",
+  "admin_id": "YOUR_CHAT_ID",
+  "proxy": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 1080,
+    "username": "",
+    "password": ""
+  }
 }

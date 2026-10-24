@@ -2,6 +2,7 @@
 """
 SessionKiller - Telegram Login Session Monitor Bot
 Monitors login sessions and automatically logs out untrusted devices.
+Controlled via a separate Telegram Bot token.
 """
 
 import asyncio
@@ -11,11 +12,11 @@ import os
 from datetime import datetime
 from typing import Set, Dict, Any
 
+import socks
 from telethon import TelegramClient, events
 from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
 from telethon.tl.types import Authorization
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -27,22 +28,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class SessionMonitorBot:
-    def __init__(self, api_id: int, api_hash: str, phone: str):
+    def __init__(self, api_id: int, api_hash: str, phone: str, bot_token: str, admin_id: int, proxy: tuple = None):
         self.api_id = api_id
         self.api_hash = api_hash
         self.phone = phone
-        self.client = TelegramClient('session_monitor', api_id, api_hash)
+        self.bot_token = bot_token
+        self.admin_id = admin_id
         
-        # File to store trusted device hashes
+        self.client = TelegramClient('session_monitor', api_id, api_hash, proxy=proxy)
+        self.bot = TelegramClient('bot_session', api_id, api_hash, proxy=proxy)
+        
         self.trusted_devices_file = 'trusted_devices.json'
         self.trusted_devices: Set[int] = self.load_trusted_devices()
         
-        # Known sessions to track changes
         self.known_sessions: Dict[int, Authorization] = {}
         
-        # Monitor settings
         self.monitoring = False
-        self.scan_interval = 0.5  # seconds
+        self.scan_interval = 0.5
         
     def load_trusted_devices(self) -> Set[int]:
         """Load trusted device hashes from file."""
@@ -68,7 +70,6 @@ class SessionMonitorBot:
         try:
             result = await self.client(GetAuthorizationsRequest())
             sessions = {}
-            # Access authorizations with proper type handling
             auths = getattr(result, 'authorizations', [])
             for auth in auths:
                 sessions[auth.hash] = auth
@@ -89,7 +90,6 @@ class SessionMonitorBot:
     
     def format_session_info(self, auth: Authorization) -> str:
         """Format session information for display."""
-        # Handle datetime objects properly with None checks
         if auth.date_created:
             date_created = auth.date_created if isinstance(auth.date_created, datetime) else datetime.fromtimestamp(auth.date_created)
         else:
@@ -116,7 +116,6 @@ class SessionMonitorBot:
         """Main monitoring loop."""
         logger.info("Starting session monitoring...")
         
-        # Initialize known sessions
         self.known_sessions = await self.get_current_sessions()
         logger.info(f"Initialized with {len(self.known_sessions)} known sessions")
         
@@ -124,20 +123,16 @@ class SessionMonitorBot:
             try:
                 current_sessions = await self.get_current_sessions()
                 
-                # Check for new sessions
                 for session_hash, auth in current_sessions.items():
                     if session_hash not in self.known_sessions:
-                        # New session detected
                         logger.info(f"New session detected: {session_hash}")
                         
-                        # Check if it's a trusted device
                         if session_hash in self.trusted_devices:
                             logger.info(f"Session {session_hash} is trusted, allowing...")
                             await self.send_notification(
                                 f"✅ Trusted device logged in:\n{self.format_session_info(auth)}"
                             )
                         else:
-                            # Untrusted device - log it out
                             logger.warning(f"Untrusted session detected, logging out: {session_hash}")
                             
                             await self.send_notification(
@@ -152,44 +147,40 @@ class SessionMonitorBot:
                             else:
                                 logger.error(f"Failed to log out untrusted session: {session_hash}")
                 
-                # Update known sessions
                 self.known_sessions = current_sessions
-                
                 await asyncio.sleep(self.scan_interval)
                 
             except Exception as e:
                 logger.error(f"Error in monitoring loop: {e}")
-                await asyncio.sleep(1)  # Wait before retrying
+                await asyncio.sleep(1)
     
     async def send_notification(self, message: str):
-        """Send notification to the user."""
+        """Send notification to the admin via bot."""
         try:
-            await self.client.send_message('me', message)
+            await self.bot.send_message(self.admin_id, message)
         except Exception as e:
             logger.error(f"Error sending notification: {e}")
     
     async def start(self):
-        """Start the bot."""
-        # Connect and start the client
+        """Start the bot and user client."""
         await self.client.connect()
         if not await self.client.is_user_authorized():
             await self.client.send_code_request(self.phone)
             code = input('Enter the code you received: ')
             await self.client.sign_in(self.phone, code)
         
-        logger.info("Bot started successfully!")
+        await self.bot.start(bot_token=self.bot_token)
+        logger.info("Bot client started successfully via token (with SOCKS5 proxy)!")
         
-        # Set up event handlers
         self.setup_handlers()
         
-        # Start monitoring
         self.monitoring = True
         await self.monitor_sessions()
     
     def setup_handlers(self):
-        """Set up command handlers."""
+        """Set up command handlers on the bot client (restricted to admin_id)."""
         
-        @self.client.on(events.NewMessage(pattern='/start', from_users='me'))
+        @self.bot.on(events.NewMessage(pattern='/start', from_users=self.admin_id))
         async def start_handler(event):
             await event.respond(
                 "🔥 **SessionKiller Bot**\n\n"
@@ -204,7 +195,7 @@ class SessionMonitorBot:
                 "/resume - Resume monitoring"
             )
         
-        @self.client.on(events.NewMessage(pattern='/status', from_users='me'))
+        @self.bot.on(events.NewMessage(pattern='/status', from_users=self.admin_id))
         async def status_handler(event):
             status = "🟢 Active" if self.monitoring else "🔴 Stopped"
             sessions_count = len(self.known_sessions)
@@ -217,7 +208,7 @@ class SessionMonitorBot:
                 f"⏱️ **Scan Interval:** {self.scan_interval}s"
             )
         
-        @self.client.on(events.NewMessage(pattern='/sessions', from_users='me'))
+        @self.bot.on(events.NewMessage(pattern='/sessions', from_users=self.admin_id))
         async def sessions_handler(event):
             sessions = await self.get_current_sessions()
             if not sessions:
@@ -233,21 +224,21 @@ class SessionMonitorBot:
             
             await event.respond(message)
         
-        @self.client.on(events.NewMessage(pattern=r'/trust (\d+)', from_users='me'))
+        @self.bot.on(events.NewMessage(pattern=r'/trust (\d+)', from_users=self.admin_id))
         async def trust_handler(event):
             session_hash = int(event.pattern_match.group(1))
             self.trusted_devices.add(session_hash)
             self.save_trusted_devices()
             await event.respond(f"✅ Device {session_hash} is now trusted.")
         
-        @self.client.on(events.NewMessage(pattern=r'/untrust (\d+)', from_users='me'))
+        @self.bot.on(events.NewMessage(pattern=r'/untrust (\d+)', from_users=self.admin_id))
         async def untrust_handler(event):
             session_hash = int(event.pattern_match.group(1))
             self.trusted_devices.discard(session_hash)
             self.save_trusted_devices()
             await event.respond(f"❌ Device {session_hash} is no longer trusted.")
         
-        @self.client.on(events.NewMessage(pattern='/trusted', from_users='me'))
+        @self.bot.on(events.NewMessage(pattern='/trusted', from_users=self.admin_id))
         async def trusted_handler(event):
             if not self.trusted_devices:
                 await event.respond("No trusted devices configured.")
@@ -259,23 +250,21 @@ class SessionMonitorBot:
             
             await event.respond(message)
         
-        @self.client.on(events.NewMessage(pattern='/stop', from_users='me'))
+        @self.bot.on(events.NewMessage(pattern='/stop', from_users=self.admin_id))
         async def stop_handler(event):
             self.monitoring = False
             await event.respond("🛑 Session monitoring stopped.")
         
-        @self.client.on(events.NewMessage(pattern='/resume', from_users='me'))
+        @self.bot.on(events.NewMessage(pattern='/resume', from_users=self.admin_id))
         async def resume_handler(event):
             if not self.monitoring:
                 self.monitoring = True
                 await event.respond("▶️ Session monitoring resumed.")
-                # Restart monitoring in background
                 asyncio.create_task(self.monitor_sessions())
             else:
                 await event.respond("ℹ️ Monitoring is already active.")
 
 async def main():
-    # Load configuration
     try:
         with open('config.json', 'r') as f:
             config = json.load(f)
@@ -286,18 +275,33 @@ async def main():
         logger.error("Invalid JSON in config.json")
         return
     
-    # Validate configuration
-    required_keys = ['api_id', 'api_hash', 'phone']
+    required_keys = ['api_id', 'api_hash', 'phone', 'bot_token', 'admin_id']
     for key in required_keys:
         if key not in config:
             logger.error(f"Missing required configuration: {key}")
             return
     
-    # Create and start bot
+    proxy_tuple = None
+    proxy_config = config.get('proxy')
+    if proxy_config and proxy_config.get('enabled', False):
+        host = proxy_config.get('host')
+        port = int(proxy_config.get('port'))
+        username = proxy_config.get('username')
+        password = proxy_config.get('password')
+        
+        if username and password:
+            proxy_tuple = (socks.SOCKS5, host, port, True, username, password)
+        else:
+            proxy_tuple = (socks.SOCKS5, host, port)
+        logger.info(f"SOCKS5 Proxy enabled for {host}:{port}")
+
     bot = SessionMonitorBot(
         api_id=config['api_id'],
         api_hash=config['api_hash'],
-        phone=config['phone']
+        phone=config['phone'],
+        bot_token=config['bot_token'],
+        admin_id=config['admin_id'],
+        proxy=proxy_tuple
     )
     
     try:
@@ -308,7 +312,9 @@ async def main():
         logger.error(f"Bot error: {e}")
     finally:
         if bot.client.is_connected():
-            bot.client.disconnect()
+            await bot.client.disconnect()
+        if bot.bot.is_connected():
+            await bot.bot.disconnect()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.main() if hasattr(asyncio, 'main') else asyncio.run(main())
